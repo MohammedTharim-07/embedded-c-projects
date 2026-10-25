@@ -1,0 +1,195 @@
+#include <xc.h>
+#include <stdint.h>
+#pragma config FOSC   = HS
+#pragma config WDTE   = OFF
+#pragma config PWRTE  = ON
+#pragma config MCLRE  = ON
+#pragma config CP     = OFF
+#pragma config CPD    = OFF
+#pragma config BOREN  = ON
+#pragma config IESO   = OFF
+#pragma config FCMEN  = OFF
+#pragma config LVP    = OFF
+#define _XTAL_FREQ 20000000UL  
+#define IN1 RB0
+#define IN2 RB1
+#define IN3 RB2
+#define IN4 RB3
+
+volatile char gotChar   = 0;     
+volatile char lastChar  = 'S';   
+unsigned int noCmdCount = 0;     
+char currentCmd = 'S';  
+char previousCmd = 'S';  
+#define TIMEOUT_LIMIT 30   
+
+// ---- function list ----
+void setupPins(void);
+void setupUART(void);
+void setupPWM(void);
+void setupTimer(void);
+void timer(unsigned int ms);
+void stopMotors(void);
+void goForward(void);
+void goBackward(void);
+void turnLeft(void);
+void turnRight(void);
+void runCommand(char cmd);
+
+void main(void)
+{
+    setupPins();
+    setupUART();
+    setupPWM();
+    setupTimer();
+    stopMotors();          
+    currentCmd = 'S';
+    INTCONbits.GIE  = 1;    
+    INTCONbits.PEIE = 1;
+
+    while (1)
+    {
+        if (gotChar == 1)
+        {
+            gotChar = 0;  
+            if (lastChar=='F' || lastChar=='B' || lastChar=='L' || lastChar=='R' || lastChar=='S')
+            {
+                currentCmd = lastChar;  // f
+                noCmdCount = 0;      
+                runCommand(currentCmd);
+            }
+        }
+
+        timer(1000);                 
+        if (currentCmd != 'S')
+        {
+            noCmdCount++;
+        }
+
+        if (noCmdCount >= TIMEOUT_LIMIT && currentCmd != 'S')
+        {
+            currentCmd = 'S';
+            runCommand(currentCmd);
+        }
+    }
+}
+
+void setupPins(void)
+{
+    ANSEL  = 0;
+    ANSELH = 0;
+    TRISB &= 0xF0;   
+    PORTB &= 0xF0;
+    TRISC1 = 0;       
+    TRISC2 = 0;      
+    TRISC6 = 0;       
+    TRISC7 = 1;     
+}
+
+void setupUART(void)
+{
+    TXSTAbits.SYNC = 0;
+    TXSTAbits.BRGH = 1;
+    BAUDCTLbits.BRG16 = 0;
+ 
+    SPBRG = (_XTAL_FREQ / 9600 / 16) - 1;  
+    RCSTAbits.SPEN = 1;   
+    TXSTAbits.TXEN = 1;
+    RCSTAbits.CREN = 1; 
+    PIE1bits.RCIE = 1;  
+}
+
+void setupPWM(void)
+{
+    PR2 = 255;
+    T2CONbits.T2CKPS = 0;
+    T2CONbits.TMR2ON = 1;
+    CCP1CONbits.CCP1M = 0b1100;   
+    CCP2CONbits.CCP2M = 0b1100;   
+    CCPR1L = 150;   
+    CCPR2L = 150; 
+}
+
+void setupTimer(void)
+{
+    T1CON = 21;   
+}
+
+void timer(unsigned int ms)
+{
+    unsigned int i;
+    for (i = 0; i < ms; i++)
+    {
+        TMR1H = 0xFF;
+        TMR1L = 0x06;
+        PIR1bits.TMR1IF = 0;
+        T1CONbits.TMR1ON = 1;
+        while (!PIR1bits.TMR1IF);
+        T1CONbits.TMR1ON = 0;
+    }
+}
+
+void stopMotors(void)
+{
+    IN1 = 0; IN2 = 0;
+    IN3 = 0; IN4 = 0;
+}
+
+void goForward(void)
+{
+    IN1 = 1; IN2 = 0;   
+    IN3 = 1; IN4 = 0;  
+}
+
+void goBackward(void)
+{
+    IN1 = 0; IN2 = 1;   // left  side reverse
+    IN3 = 0; IN4 = 1;   // right side reverse
+}
+
+void turnLeft(void)
+{
+    IN1 = 0; IN2 = 1;   
+    IN3 = 1; IN4 = 0;   
+}
+
+void turnRight(void)
+{
+    IN1 = 1; IN2 = 0;   
+    IN3 = 0; IN4 = 1;   
+}
+
+void runCommand(char cmd)
+{
+    char reversing = 0;
+    if (previousCmd=='F' && cmd=='B') reversing = 1;
+    if (previousCmd=='B' && cmd=='F') reversing = 1;
+    if (previousCmd=='L' && cmd=='R') reversing = 1;
+    if (previousCmd=='R' && cmd=='L') reversing = 1;
+    if (reversing == 1)
+    {
+        stopMotors();
+        __delay_ms(50);
+    }
+    if (cmd == 'F') goForward();
+    else if (cmd == 'B') goBackward();
+    else if (cmd == 'L') turnLeft();
+    else if (cmd == 'R') turnRight();
+    else stopMotors();      
+    previousCmd = cmd;
+}
+
+void __interrupt() ISR(void)
+{
+    if (PIR1bits.RCIF)
+    {
+        if (RCSTAbits.OERR)     
+        {
+            RCSTAbits.CREN = 0;
+            RCSTAbits.CREN = 1;
+        }
+        lastChar = RCREG;  
+        gotChar  = 1;
+    }
+    
+}
