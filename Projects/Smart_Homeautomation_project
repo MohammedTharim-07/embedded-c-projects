@@ -1,0 +1,1019 @@
+#include <stm32f10x.h>
+
+/* =========================================================
+   PIN CONNECTIONS
+
+   LCD:
+   PA0  -> D4
+   PA1  -> D5
+   PA2  -> D6
+   PA3  -> D7
+   PC14 -> EN
+   PC15 -> RS
+
+   SENSORS:
+   PA4  -> LM35 / ADC1_CH4
+   PA5  -> LDR  / ADC1_CH5
+   PA8  -> PIR
+
+   OUTPUTS:
+   PB0  -> TIM3_CH3 PWM FAN
+   PB1  -> LIGHT LED
+
+   BUTTON:
+   PB10 -> MANUAL BUTTON
+
+   UART:
+   PA9  -> USART1 TX -> ESP32 GPIO16 RX
+   PA10 -> USART1 RX
+
+   ========================================================= */
+
+
+/* =========================================================
+   TIM1 DELAY
+
+   HSI = 8 MHz
+
+   TIM1 clock = 8 MHz
+   PSC = 7
+
+   8 MHz / 8 = 1 MHz
+
+   1 count = 1 us
+   ========================================================= */
+
+void TIM1_Init(void)
+{
+    /* Enable TIM1 clock */
+    RCC->APB2ENR |= (1 << 11);
+
+    /* 1 MHz timer */
+    TIM1->PSC = 7;
+
+    /* Maximum 1 ms */
+    TIM1->ARR = 999;
+
+    TIM1->CNT = 0;
+
+    /* Load registers */
+    TIM1->EGR = 1;
+
+    /* Clear update flag */
+    TIM1->SR &= ~(1 << 0);
+
+    /* Start timer */
+    TIM1->CR1 |= (1 << 0);
+}
+
+
+/* =========================================================
+   TIMER DELAY IN MICROSECONDS
+
+   Maximum = 1000 us
+   ========================================================= */
+
+void delay_us(unsigned int us)
+{
+    if(us == 0)
+        return;
+
+    if(us > 1000)
+        us = 1000;
+
+    TIM1->ARR = us - 1;
+
+    TIM1->CNT = 0;
+
+    TIM1->SR &= ~(1 << 0);
+
+    while(!(TIM1->SR & (1 << 0)));
+}
+
+
+/* =========================================================
+   TIMER DELAY IN MILLISECONDS
+   ========================================================= */
+
+void delay_ms(unsigned int ms)
+{
+    unsigned int i;
+
+    for(i = 0; i < ms; i++)
+    {
+        delay_us(1000);
+    }
+}
+
+
+/* =========================================================
+   LCD ENABLE
+   ========================================================= */
+
+void enable(void)
+{
+    GPIOC->BSRR = (1 << 14);
+
+    delay_us(20);
+
+    GPIOC->BRR = (1 << 14);
+
+    delay_us(20);
+}
+
+
+/* =========================================================
+   LCD SEND COMMAND / DATA
+
+   rs = 0 -> COMMAND
+   rs = 1 -> DATA
+   ========================================================= */
+
+void lcd(char rs, char data)
+{
+    /* RS */
+
+    if(rs)
+        GPIOC->BSRR = (1 << 15);
+    else
+        GPIOC->BRR = (1 << 15);
+
+
+    /* HIGH NIBBLE */
+
+    GPIOA->ODR =
+        (GPIOA->ODR & 0xFFFFFFF0) |
+        ((data >> 4) & 0x0F);
+
+    enable();
+
+
+    /* LOW NIBBLE */
+
+    GPIOA->ODR =
+        (GPIOA->ODR & 0xFFFFFFF0) |
+        (data & 0x0F);
+
+    enable();
+}
+
+
+/* =========================================================
+   LCD STRING
+   ========================================================= */
+
+void lcd_string(char *str)
+{
+    while(*str)
+    {
+        lcd(1, *str);
+
+        str++;
+    }
+}
+
+
+/* =========================================================
+   LCD NUMBER
+   ========================================================= */
+
+void LCD_Number(unsigned int num)
+{
+    char buffer[10];
+    int i;
+
+    i = 0;
+
+    if(num == 0)
+    {
+        lcd(1, '0');
+
+        return;
+    }
+
+    while(num > 0)
+    {
+        buffer[i] = (num % 10) + '0';
+
+        num = num / 10;
+
+        i++;
+    }
+
+    while(i > 0)
+    {
+        i--;
+
+        lcd(1, buffer[i]);
+    }
+}
+
+
+/* =========================================================
+   LCD INITIALIZATION
+   ========================================================= */
+
+void LCD_Init(void)
+{
+    delay_ms(20);
+
+    lcd(0, 0x02);
+    lcd(0, 0x0C);
+    lcd(0, 0x28);
+    lcd(0, 0x06);
+    lcd(0, 0x01);
+
+    delay_ms(5);
+}
+
+
+/* =========================================================
+   UART INITIALIZATION
+
+   HSI = 8 MHz
+   Baud = 9600
+
+   PA9  = TX
+   PA10 = RX
+   ========================================================= */
+
+void UART_Init(void)
+{
+    /* Enable USART1 clock */
+    RCC->APB2ENR |= (1 << 14);
+
+
+    /*
+       PA9:
+       Alternate Function Push-Pull
+
+       PA10:
+       Input Floating
+    */
+
+    GPIOA->CRH &= ~((0xF << 4) |
+                    (0xF << 8));
+
+    /* PA9 TX */
+    GPIOA->CRH |= (0xB << 4);
+
+    /* PA10 RX */
+    GPIOA->CRH |= (0x4 << 8);
+
+
+    /* 9600 baud @ 8 MHz */
+    USART1->BRR = 0x0341;
+
+
+    /* Disable USART before configuration */
+    USART1->CR1 = 0;
+
+
+    /* Enable USART */
+    USART1->CR1 |= (1 << 13);
+
+    /* Enable transmitter */
+    USART1->CR1 |= (1 << 3);
+
+    /* Enable receiver */
+    USART1->CR1 |= (1 << 2);
+}
+
+
+/* =========================================================
+   UART SEND CHARACTER
+   ========================================================= */
+
+void UART_Send(char c)
+{
+    while(!(USART1->SR & (1 << 7)));
+
+    USART1->DR = c;
+}
+
+
+/* =========================================================
+   UART STRING
+   ========================================================= */
+
+void UART_String(char *str)
+{
+    while(*str)
+    {
+        UART_Send(*str);
+
+        str++;
+    }
+}
+
+
+/* =========================================================
+   UART NUMBER
+   ========================================================= */
+
+void UART_Number(unsigned int num)
+{
+    char buffer[10];
+    int i;
+
+    i = 0;
+
+    if(num == 0)
+    {
+        UART_Send('0');
+
+        return;
+    }
+
+    while(num > 0)
+    {
+        buffer[i] = (num % 10) + '0';
+
+        num = num / 10;
+
+        i++;
+    }
+
+    while(i > 0)
+    {
+        i--;
+
+        UART_Send(buffer[i]);
+    }
+}
+
+
+/* =========================================================
+   ADC INITIALIZATION
+
+   PA4 = ADC1 CH4 = LM35
+   PA5 = ADC1 CH5 = LDR
+   ========================================================= */
+
+void ADC_Init(void)
+{
+    /* Enable ADC1 clock */
+    RCC->APB2ENR |= (1 << 9);
+
+
+    /*
+       ADC clock:
+
+       8 MHz / 2 = 4 MHz
+    */
+
+    RCC->CFGR &= ~(3 << 14);
+
+
+    /* Long sample time for CH4 and CH5 */
+
+    ADC1->SMPR2 &= ~((7 << 12) |
+                     (7 << 15));
+
+    ADC1->SMPR2 |= ((7 << 12) |
+                    (7 << 15));
+
+
+    /* One conversion */
+
+    ADC1->SQR1 = 0;
+
+
+    /* ADC OFF */
+
+    ADC1->CR2 = 0;
+
+
+    /* ADC ON */
+
+    ADC1->CR2 |= (1 << 0);
+
+    delay_us(100);
+
+
+    /*
+       Software trigger
+    */
+
+    ADC1->CR2 |= (7 << 17);
+
+    ADC1->CR2 |= (1 << 20);
+}
+
+
+/* =========================================================
+   ADC READ
+   ========================================================= */
+
+unsigned int ADC_Read(unsigned char channel)
+{
+    unsigned int value;
+
+    /* Select channel */
+
+    ADC1->SQR3 = channel;
+
+
+    /* Clear flags */
+
+    ADC1->SR = 0;
+
+
+    /* Start conversion */
+
+    ADC1->CR2 |= (1 << 22);
+
+
+    /* Wait for conversion */
+
+    while(!(ADC1->SR & (1 << 1)));
+
+
+    /* Read result */
+
+    value = ADC1->DR;
+
+
+    return value;
+}
+
+
+/* =========================================================
+   TIM3 PWM
+
+   PB0 = TIM3_CH3
+
+   8 MHz timer clock
+
+   PSC = 0
+   ARR = 399
+
+   PWM = 20 kHz
+   ========================================================= */
+
+void PWM_Init(void)
+{
+    /* Enable TIM3 clock */
+
+    RCC->APB1ENR |= (1 << 1);
+
+
+    /* PB0 AF Push-Pull */
+
+    GPIOB->CRL &= ~(0xF << 0);
+
+    GPIOB->CRL |= (0xB << 0);
+
+
+    /* Timer */
+
+    TIM3->PSC = 0;
+
+    TIM3->ARR = 399;
+
+    TIM3->CNT = 0;
+
+
+    /*
+       PWM Mode 1
+
+       OC3M = 110
+    */
+
+    TIM3->CCMR2 &= ~(0xFF);
+
+    TIM3->CCMR2 |= (6 << 4);
+
+    /* OC3 preload */
+
+    TIM3->CCMR2 |= (1 << 3);
+
+
+    /* Enable CH3 */
+
+    TIM3->CCER |= (1 << 8);
+
+
+    /* Initial OFF */
+
+    TIM3->CCR3 = 0;
+
+
+    /* ARR preload */
+
+    TIM3->CR1 |= (1 << 7);
+
+
+    /* Start timer */
+
+    TIM3->CR1 |= (1 << 0);
+}
+
+
+/* =========================================================
+   FAN PWM
+   ========================================================= */
+
+void Fan_Set_Duty(unsigned char duty)
+{
+    unsigned int compare;
+
+    if(duty == 0)
+    {
+        TIM3->CCR3 = 0;
+
+        GPIOB->BRR = (1 << 0);
+
+        return;
+    }
+
+
+    compare =
+        ((unsigned int)duty * 400) / 100;
+
+
+    TIM3->CCR3 = compare;
+}
+
+
+/* =========================================================
+   LIGHT ON
+   ========================================================= */
+
+void Light_ON(void)
+{
+    GPIOB->BSRR = (1 << 1);
+}
+
+
+/* =========================================================
+   LIGHT OFF
+   ========================================================= */
+
+void Light_OFF(void)
+{
+    GPIOB->BRR = (1 << 1);
+}
+
+
+/* =========================================================
+   LCD TEMPERATURE
+   ========================================================= */
+
+void LCD_Temperature(unsigned int temp_x10)
+{
+    lcd(1, 'T');
+
+    lcd(1, ':');
+
+    LCD_Number(temp_x10 / 10);
+
+    lcd(1, '.');
+
+    LCD_Number(temp_x10 % 10);
+
+    lcd(1, 'C');
+}
+
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+int main(void)
+{
+    unsigned int lm35_adc;
+    unsigned int ldr_adc;
+
+    unsigned int lm35_mv;
+    unsigned int temperature_x10;
+
+    unsigned char motion;
+
+    unsigned char fan_duty;
+
+    unsigned char light_state;
+
+    unsigned char manual_button;
+
+
+    /* =====================================================
+       INITIAL VALUES
+       ===================================================== */
+
+    fan_duty = 0;
+
+    light_state = 0;
+
+    manual_button = 0;
+
+
+    /* =====================================================
+       CLOCK
+       ===================================================== */
+
+    RCC->CR = 0x83;
+
+    RCC->CFGR = 0;
+
+
+    /* =====================================================
+       GPIO CLOCKS
+       ===================================================== */
+
+    RCC->APB2ENR |= (1 << 2);     /* GPIOA */
+
+    RCC->APB2ENR |= (1 << 3);     /* GPIOB */
+
+    RCC->APB2ENR |= (1 << 4);     /* GPIOC */
+
+
+    /* =====================================================
+       GPIOA
+
+       PA0-PA3 = LCD
+       PA4     = LM35
+       PA5     = LDR
+       ===================================================== */
+
+    /*
+       PA0-PA3 output
+       PA4-PA5 analog
+    */
+
+    GPIOA->CRL = 0x00002222;
+
+
+    /*
+       PA8  = input pull-down
+       PA9  = UART TX
+       PA10 = UART RX
+    */
+
+    GPIOA->CRH = 0;
+
+    /* PA8 */
+
+    GPIOA->CRH |= (0x8 << 0);
+
+    /* PA9 */
+
+    GPIOA->CRH |= (0xB << 4);
+
+    /* PA10 */
+
+    GPIOA->CRH |= (0x4 << 8);
+
+
+    /* PA8 pull-down */
+
+    GPIOA->BRR = (1 << 8);
+
+
+    /* =====================================================
+       GPIOB
+
+       PB0  = PWM
+       PB1  = LIGHT
+       PB10 = MANUAL BUTTON
+       ===================================================== */
+
+    GPIOB->CRL = 0;
+
+
+    /* PB0 AF Push-Pull */
+
+    GPIOB->CRL |= (0xB << 0);
+
+
+    /* PB1 output */
+
+    GPIOB->CRL |= (0x2 << 4);
+
+
+    /*
+       PB10 input pull-down
+    */
+
+    GPIOB->CRH &= ~(0xF << 8);
+
+    GPIOB->CRH |= (0x8 << 8);
+
+
+    /* PB10 pull-down */
+
+    GPIOB->BRR = (1 << 10);
+
+
+    /* =====================================================
+       GPIOC
+
+       PC14 = LCD EN
+       PC15 = LCD RS
+       ===================================================== */
+
+    GPIOC->CRH = 0x22222222;
+
+
+    /* =====================================================
+       TIMER 1
+       ===================================================== */
+
+    TIM1_Init();
+
+
+    /* =====================================================
+       LCD
+       ===================================================== */
+
+    LCD_Init();
+
+
+    lcd(0, 0x80);
+
+    lcd_string("SMART HOME");
+
+    lcd(0, 0xC0);
+
+    lcd_string("SYSTEM READY");
+
+
+    delay_ms(500);
+
+
+    /* =====================================================
+       UART
+       ===================================================== */
+
+    UART_Init();
+
+
+    UART_String("\r\n");
+
+    UART_String("====================\r\n");
+
+    UART_String("SMART HOME SYSTEM\r\n");
+
+    UART_String("ESP32 UART READY\r\n");
+
+    UART_String("====================\r\n");
+
+
+    /* =====================================================
+       ADC
+       ===================================================== */
+
+    ADC_Init();
+
+    UART_String("ADC INIT OK\r\n");
+
+
+    /* =====================================================
+       PWM
+       ===================================================== */
+
+    PWM_Init();
+
+    UART_String("PWM INIT OK\r\n");
+
+
+    /* =====================================================
+       INITIAL OUTPUTS
+       ===================================================== */
+
+    Light_OFF();
+
+    Fan_Set_Duty(0);
+
+
+    /* =====================================================
+       MAIN LOOP
+       ===================================================== */
+
+    while(1)
+    {
+        /* =================================================
+           1. READ LM35
+           ================================================= */
+
+        lm35_adc = ADC_Read(4);
+
+
+        /*
+           ADC voltage:
+
+           mV = ADC * 3300 / 4095
+        */
+
+        lm35_mv =
+            ((unsigned long)lm35_adc * 3300) / 4095;
+
+
+        /*
+           LM35:
+
+           10mV = 1°C
+
+           temperature_x10 = mV
+        */
+
+        temperature_x10 = lm35_mv;
+
+
+        /* =================================================
+           2. READ LDR
+           ================================================= */
+
+        ldr_adc = ADC_Read(5);
+
+
+        /* =================================================
+           3. READ PIR
+           ================================================= */
+
+        if(GPIOA->IDR & (1 << 8))
+            motion = 1;
+        else
+            motion = 0;
+
+
+        /* =================================================
+           4. READ MANUAL BUTTON
+
+           PB10:
+
+           PRESSED  -> manual light ON
+           RELEASED -> automatic mode
+
+           This is NOT latched.
+           ================================================= */
+
+        if(GPIOB->IDR & (1 << 10))
+            manual_button = 1;
+        else
+            manual_button = 0;
+
+
+        /* =================================================
+           5. FAN CONTROL
+           ================================================= */
+
+        if(temperature_x10 < 290)
+        {
+            fan_duty = 0;
+        }
+        else if(temperature_x10 < 330)
+        {
+            fan_duty = 40;
+        }
+        else
+        {
+            fan_duty = 80;
+        }
+
+
+        Fan_Set_Duty(fan_duty);
+
+
+        /* =================================================
+           6. LIGHT CONTROL
+
+           MANUAL:
+           Button pressed -> ON
+
+           AUTO:
+           Dark + Motion -> ON
+           Otherwise -> OFF
+           ================================================= */
+
+        if(manual_button)
+        {
+            Light_ON();
+
+            light_state = 1;
+        }
+        else
+        {
+            if((ldr_adc < 1500) && motion)
+            {
+                Light_ON();
+
+                light_state = 1;
+            }
+            else
+            {
+                Light_OFF();
+
+                light_state = 0;
+            }
+        }
+
+
+        /* =================================================
+           7. LCD UPDATE
+
+           Same working LCD logic.
+           ================================================= */
+
+        lcd(0, 0x80);
+
+        LCD_Temperature(temperature_x10);
+
+        lcd_string(" F:");
+
+        LCD_Number(fan_duty);
+
+        lcd(1, '%');
+
+        lcd_string("   ");
+
+
+        lcd(0, 0xC0);
+
+        lcd_string("L:");
+
+        if(light_state)
+            lcd_string("ON ");
+        else
+            lcd_string("OFF");
+
+
+        lcd_string(" M:");
+
+        if(motion)
+            lcd(1, '1');
+        else
+            lcd(1, '0');
+
+
+        lcd_string(" ");
+
+
+        if(manual_button)
+            lcd_string("MAN");
+        else
+            lcd_string("AUT");
+
+
+        /* =================================================
+           8. SEND DATA TO ESP32
+
+           EXACT FORMAT:
+
+           TEMP=28.4,LDR=1200,PIR=1,
+           LIGHT=1,FAN=40,MODE=0
+
+           MODE:
+           0 = AUTO
+           1 = MANUAL
+           ================================================= */
+
+        UART_String("TEMP=");
+
+        UART_Number(temperature_x10 / 10);
+
+        UART_Send('.');
+
+        UART_Number(temperature_x10 % 10);
+
+
+        UART_String(",LDR=");
+
+        UART_Number(ldr_adc);
+
+
+        UART_String(",PIR=");
+
+        UART_Number(motion);
+
+
+        UART_String(",LIGHT=");
+
+        UART_Number(light_state);
+
+
+        UART_String(",FAN=");
+
+        UART_Number(fan_duty);
+
+
+        UART_String(",MODE=");
+
+        if(manual_button)
+            UART_Send('1');
+        else
+            UART_Send('0');
+
+
+        UART_String("\r\n");
+
+
+        /* =================================================
+           9. LOOP RATE
+
+           20 ms
+           ================================================= */
+
+        delay_ms(20);
+    }
+}
